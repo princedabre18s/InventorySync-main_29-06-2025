@@ -1,0 +1,1814 @@
+# report.py
+import os
+import pandas as pd
+import numpy as np
+import time
+import json
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.io import write_image
+from datetime import datetime, timedelta
+import google.generativeai as genai
+import psycopg2
+import sqlite3
+import tempfile
+import glob
+import io
+import base64
+from typing import Dict, List, Any, Optional, Union
+from flask import Flask, request, jsonify, send_file, render_template, Blueprint
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle, PageBreak, KeepTogether
+from reportlab.lib.units import inch, cm
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
+from reportlab.platypus.flowables import HRFlowable, Flowable
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus.frames import Frame
+from reportlab.graphics.shapes import Drawing, Rect
+from reportlab.lib.colors import Color, HexColor
+from reportlab.graphics.charts.piecharts import Pie
+from markdown import markdown
+import re
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from io import BytesIO
+from sqlalchemy import create_engine
+
+# Load environment variables
+load_dotenv()
+
+# Configure Gemini API
+API_KEY = os.getenv("GEMINI_API_KEY")
+if not API_KEY:
+    print("Warning: GEMINI_API_KEY not found in environment variables. Please set it.")
+    API_KEY = ""  # Placeholder, will fail if not replaced
+
+genai.configure(api_key=API_KEY)
+
+# Initialize Gemini model
+model = genai.GenerativeModel('gemini-2.0-flash')
+
+# Blueprint setup for Flask
+report_bp = Blueprint('report', __name__)
+
+# Constants
+TEMP_STORAGE_DIR = "temp_storage"
+PROCESSED_DIR = "processed_data"
+REPORT_DIR = "reports"
+ARCHIVED_REPORTS_DIR = "archived_reports"
+LOGO_PATH = "static/images/logo.png"
+DEFAULT_LOGO = "static/images/default-logo.png"
+
+# Create necessary directories if they don't exist
+for directory in [REPORT_DIR, ARCHIVED_REPORTS_DIR]:
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+# Database connection functions (using the same approach as in data.py)
+def get_db_connection():
+    """Establish connection to Neon Database using .env variables"""
+    try:
+        conn = psycopg2.connect(
+            host=os.getenv("DB_HOST"),
+            database=os.getenv("DB_NAME"),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD"),
+            port=os.getenv("DB_PORT"),
+        )
+        return conn
+    except Exception as e:
+        print(f"Database connection error: {e}")
+        print(f"Connection details: host={os.getenv('DB_HOST')}, db={os.getenv('DB_NAME')}, port={os.getenv('DB_PORT')}")
+        return None
+
+def get_sqlalchemy_engine():
+    """Create SQLAlchemy engine using .env variables - same as data.py uses"""
+    try:
+        from sqlalchemy import create_engine
+        return create_engine(
+            f'postgresql://{os.getenv("DB_USER")}:{os.getenv("DB_PASSWORD")}@{os.getenv("DB_HOST")}:{os.getenv("DB_PORT")}/{os.getenv("DB_NAME")}'
+        )
+    except Exception as e:
+        print(f"Error creating SQLAlchemy engine: {e}")
+        return None
+
+class DataSourceManager:
+    def __init__(self):
+        self.temp_db_path = None
+        self.conn = None
+        self.cursor = None
+        self.available_tables = []
+        self.processed_data_dir = PROCESSED_DIR
+    
+    def cleanup(self):
+        """Clean up temporary resources"""
+        if self.conn:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            
+        if self.temp_db_path and os.path.exists(self.temp_db_path):
+            try:
+                os.remove(self.temp_db_path)
+                print(f"Temporary database removed: {self.temp_db_path}")
+            except Exception as e:
+                print(f"Warning: Could not remove temporary database: {e}")
+    
+    def find_excel_files(self) -> Dict[str, Dict[str, Any]]:
+        """Find and validate Excel files in the processed_data directory"""
+        result = {}
+        grand_total_dates = {}
+        
+        # Check for master_summary.xlsx
+        master_summary_path = os.path.join(self.processed_data_dir, "master_summary.xlsx")
+        if os.path.exists(master_summary_path):
+            try:
+                df = pd.read_excel(master_summary_path)
+                
+                # Extract actual column names to understand what's available
+                columns = list(df.columns)
+                print(f"Master summary columns: {columns}")
+                
+                # Extract grand total date
+                grand_total_row = df[df['Brand'].str.lower() == 'grand total'].iloc[0] if any(df['Brand'].str.lower() == 'grand total') else None
+                grand_total_date = grand_total_row['date'] if grand_total_row is not None and 'date' in df.columns else None
+                
+                # Store grand total date for future reference
+                if grand_total_date:
+                    grand_total_dates["master_summary"] = grand_total_date
+                
+                result["master_summary"] = {
+                    "status": "available",
+                    "path": master_summary_path,
+                    "columns": columns,
+                    "row_count": len(df),
+                    "grand_total_date": grand_total_date,
+                }
+            except Exception as e:
+                result["master_summary"] = {
+                    "status": "unavailable",
+                    "path": master_summary_path,
+                    "error": str(e)
+                }
+        else:
+            result["master_summary"] = {
+                "status": "unavailable",
+                "error": f"File not found: {master_summary_path}"
+            }
+        
+        # Find daily sales files (salesninventory_YYMMDD.xlsx)
+        daily_files = glob.glob(os.path.join(self.processed_data_dir, "salesninventory_*.xlsx"))
+        if daily_files:
+            # Sort by filename which should reflect date
+            daily_files.sort(reverse=True)
+            
+            daily_files_info = []
+            for file_path in daily_files[:5]:  # Process only the 5 most recent for info
+                try:
+                    file_name = os.path.basename(file_path)
+                    df = pd.read_excel(file_path)
+                    
+                    # Extract actual column names to understand what's available
+                    columns = list(df.columns)
+                    print(f"Daily file {file_name} columns: {columns}")
+                    
+                    # Extract grand total date
+                    grand_total_row = df[df['Brand'].str.lower() == 'grand total'].iloc[0] if any(df['Brand'].str.lower() == 'grand total') else None
+                    grand_total_date = grand_total_row['date'] if grand_total_row is not None and 'date' in df.columns else None
+                    
+                    # Store grand total date for future reference
+                    if grand_total_date:
+                        grand_total_dates[file_name] = grand_total_date
+                    
+                    daily_files_info.append({
+                        "file": file_name,
+                        "path": file_path,
+                        "rows": len(df),
+                        "columns": columns,
+                        "grand_total_date": grand_total_date
+                    })
+                except Exception as e:
+                    daily_files_info.append({
+                        "file": os.path.basename(file_path),
+                        "path": file_path,
+                        "error": str(e)
+                    })
+            
+            result["daily_files"] = {
+                "status": "available",
+                "files": [os.path.basename(f) for f in daily_files],
+                "file_count": len(daily_files),
+                "latest_files_info": daily_files_info,
+            }
+        else:
+            result["daily_files"] = {
+                "status": "unavailable",
+                "error": "No salesninventory_*.xlsx files found"
+            }
+            
+        return result, grand_total_dates
+    
+    def create_temp_sqlite_db(self):
+        """Create a temporary SQLite database from Excel files"""
+        # Clean up any existing connection
+        if self.conn:
+            self.conn.close()
+            self.conn = None
+            
+        if self.temp_db_path and os.path.exists(self.temp_db_path):
+            try:
+                os.remove(self.temp_db_path)
+            except Exception:
+                pass
+        
+        # Get Excel files
+        excel_files, grand_total_dates = self.find_excel_files()
+        
+        # Collect file paths
+        file_paths = []
+        if excel_files.get("master_summary", {}).get("status") == "available":
+            file_paths.append(excel_files["master_summary"]["path"])
+        
+        if excel_files.get("daily_files", {}).get("status") == "available":
+            daily_files_info = excel_files["daily_files"]
+            for file_name in daily_files_info.get("files", []):
+                file_path = os.path.join(self.processed_data_dir, file_name)
+                if os.path.exists(file_path):
+                    file_paths.append(file_path)
+        
+        if not file_paths:
+            print("No Excel files found to load into SQLite")
+            return None
+        
+        # Create a temporary file with a recognizable name
+        temp_dir = tempfile.gettempdir()
+        self.temp_db_path = os.path.join(temp_dir, f"sales_report_{int(time.time())}.db")
+        
+        # Connect to the SQLite database
+        self.conn = sqlite3.connect(self.temp_db_path, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        
+        # Track the tables we create
+        self.available_tables = []
+        
+        # Process each file
+        for file_path in file_paths:
+            try:
+                file_name = os.path.basename(file_path)
+                
+                # Determine table name (remove extension and make SQL-safe)
+                if "master_summary" in file_name.lower():
+                    table_name = "master_summary"
+                else:
+                    # Extract the date from the filename
+                    match = re.search(r'salesninventory_(\d+)\.xlsx', file_name, re.IGNORECASE)
+                    if match:
+                        date_part = match.group(1)
+                        table_name = f"daily_{date_part}"
+                    else:
+                        # Fallback to a generic name
+                        table_name = file_name.replace('.xlsx', '').lower()
+                        table_name = re.sub(r'[^a-z0-9_]', '_', table_name)
+                
+                # Read Excel file
+                print(f"Loading {file_path} into SQLite table '{table_name}'...")
+                df = pd.read_excel(file_path)
+                
+                # Add a file_source column to identify the source
+                df['file_source'] = file_name
+                
+                # Write to SQLite
+                df.to_sql(table_name, self.conn, if_exists='replace', index=False)
+                self.available_tables.append(table_name)
+                
+                # Print column names exactly as they appear in SQLite
+                cursor = self.conn.cursor()
+                cursor.execute(f"PRAGMA table_info({table_name})")
+                columns_info = cursor.fetchall()
+                column_names = [col[1] for col in columns_info]  # Col name is at index 1
+                print(f"Created table '{table_name}' with {len(df)} rows and columns: {column_names}")
+                
+                # Create a separate view without the grand total row
+                try:
+                    view_name = f"{table_name}_no_grand_total"
+                    self.cursor.execute(f"""
+                        CREATE VIEW {view_name} AS
+                        SELECT * FROM {table_name}
+                        WHERE lower(Brand) != 'grand total'
+                    """)
+                    self.available_tables.append(view_name)
+                    print(f"Created view '{view_name}' excluding grand total rows")
+                except Exception as e:
+                    print(f"Error creating view {view_name}: {e}")
+                
+            except Exception as e:
+                print(f"Error processing {file_path}: {e}")
+        
+        # Create a special table to store grand total dates
+        try:
+            grand_total_dates_df = pd.DataFrame(
+                [{"source": k, "grand_total_date": v} for k, v in grand_total_dates.items()]
+            )
+            grand_total_dates_df.to_sql("grand_total_dates", self.conn, if_exists='replace', index=False)
+            self.available_tables.append("grand_total_dates")
+            print(f"Created table 'grand_total_dates' with {len(grand_total_dates_df)} rows")
+        except Exception as e:
+            print(f"Error creating grand_total_dates table: {e}")
+        
+        return self.conn
+
+    def execute_neon_query(self, query: str) -> Union[pd.DataFrame, Dict[str, str]]:
+        """Execute a query on the Neon database"""
+        try:
+            print(f"Executing on Neon DB: {query}")
+            engine = get_sqlalchemy_engine()
+            if not engine:
+                return {"error": "Failed to create SQLAlchemy engine"}
+            
+            # Use SQLAlchemy to execute the query
+            df = pd.read_sql_query(query, engine)
+            return df
+            
+        except Exception as e:
+            error_msg = str(e)
+            print(f"Neon DB Error: {error_msg}")
+            return {"error": f"Database query error: {error_msg}"}
+    
+    def execute_sqlite_query(self, query: str) -> Union[pd.DataFrame, Dict[str, str]]:
+        """Execute a query on the temporary SQLite database"""
+        try:
+            if not self.conn:
+                return {"error": "No active SQLite connection"}
+            
+            # Print the list of available tables
+            print(f"Available SQLite tables: {', '.join(self.available_tables)}")
+            print(f"Executing on SQLite: {query}")
+            
+            df = pd.read_sql_query(query, self.conn)
+            return df
+            
+        except Exception as e:
+            error_msg = str(e)
+            print(f"SQLite Error: {error_msg}")
+            return {"error": f"SQLite query error: {error_msg}"}
+
+class ReportBuilder:
+    def __init__(self):
+        self.data_manager = DataSourceManager()
+        self.conn = self.data_manager.create_temp_sqlite_db()
+        # Report questions with predefined data sources and carefully crafted SQL queries
+        self.questions = [
+            {
+                "id": 1,
+                "question": "Notify when items reach 75% and 50% sold, including the estimated days to sell out.",
+                "data_source": "local_master",
+                "query": """
+                SELECT 
+                    Brand, 
+                    Category, 
+                    Size, 
+                    Color, 
+                    MRP, 
+                    SalesQty, 
+                    PurchaseQty,
+                    ROUND((CAST(SalesQty AS REAL) / NULLIF(PurchaseQty, 0)) * 100, 2) as percent_sold,
+                    CASE 
+                        WHEN SalesQty > 0 THEN ROUND((PurchaseQty - SalesQty) / (CAST(SalesQty AS REAL) / 30), 0)
+                        ELSE NULL 
+                    END as est_days_to_sellout
+                FROM master_summary
+                WHERE lower(Brand) != 'grand total' 
+                AND PurchaseQty > 0
+                AND ((CAST(SalesQty AS REAL) / PurchaseQty) * 100) >= 50
+                ORDER BY percent_sold DESC
+                LIMIT 10
+                """
+            },
+            {
+                "id": 2,
+                "question": "Identify the best-selling items on a weekly, monthly, and quarterly basis.",
+                "data_source": "local_daily",
+                "query": """
+                -- Use master_summary for best overall sellers
+                WITH all_items AS (
+                    SELECT 
+                        Brand,
+                        Category,
+                        Size,
+                        Color,
+                        SalesQty,
+                        date,
+                        julianday('now') - julianday(date) as days_since_record
+                    FROM master_summary
+                    WHERE lower(Brand) != 'grand total'
+                    AND SalesQty > 0
+                ),
+                weekly_best AS (
+                    SELECT 
+                        Brand,
+                        Category,
+                        Size,
+                        Color,
+                        SUM(SalesQty) as sales,
+                        'weekly' as period
+                    FROM all_items
+                    WHERE days_since_record <= 7
+                    GROUP BY Brand, Category, Size, Color
+                    ORDER BY sales DESC
+                    LIMIT 10
+                ),
+                monthly_best AS (
+                    SELECT 
+                        Brand,
+                        Category,
+                        Size,
+                        Color,
+                        SUM(SalesQty) as sales,
+                        'monthly' as period
+                    FROM all_items
+                    WHERE days_since_record <= 30
+                    GROUP BY Brand, Category, Size, Color
+                    ORDER BY sales DESC
+                    LIMIT 10
+                ),
+                quarterly_best AS (
+                    SELECT 
+                        Brand,
+                        Category,
+                        Size,
+                        Color,
+                        SUM(SalesQty) as sales,
+                        'quarterly' as period
+                    FROM all_items
+                    GROUP BY Brand, Category, Size, Color
+                    ORDER BY sales DESC
+                    LIMIT 10
+                )
+                
+                SELECT * FROM weekly_best
+                
+                UNION ALL
+                
+                SELECT * FROM monthly_best
+                
+                UNION ALL
+                
+                SELECT * FROM quarterly_best
+                
+                ORDER BY period, sales DESC
+                """
+            },
+            {
+                "id": 3,
+                "question": "Track non-moving products and their aging quantities.",
+                "data_source": "local_master",
+                "query": """
+                SELECT 
+                    Brand,
+                    Category,
+                    Size,
+                    Color,
+                    MRP,
+                    PurchaseQty,
+                    SalesQty,
+                    ROUND((CAST(SalesQty AS REAL) / NULLIF(PurchaseQty, 0)) * 100, 2) as percent_sold,
+                    julianday('now') - julianday(date) as days_in_inventory
+                FROM master_summary
+                WHERE lower(Brand) != 'grand total'
+                AND SalesQty = 0 
+                AND PurchaseQty > 0
+                ORDER BY days_in_inventory DESC, PurchaseQty DESC
+                LIMIT 10
+                """
+            },
+            {
+                "id": 4,
+                "question": "Identify slow-moving sizes within specific categories.",
+                "data_source": "local_master",
+                "query": """
+                SELECT 
+                    Category,
+                    Size,
+                    COUNT(*) as size_count,
+                    SUM(PurchaseQty) as total_purchased,
+                    SUM(SalesQty) as total_sold,
+                    ROUND(CAST(SUM(SalesQty) AS REAL) / NULLIF(SUM(PurchaseQty), 0) * 100, 2) as percent_sold,
+                    AVG(julianday('now') - julianday(date)) as avg_days_in_inventory
+                FROM master_summary
+                WHERE lower(Brand) != 'grand total'
+                AND PurchaseQty > 0
+                GROUP BY Category, Size
+                HAVING percent_sold < 30 AND size_count > 1
+                ORDER BY percent_sold
+                LIMIT 10
+                """
+            },
+            {
+                "id": 5,
+                "question": "Provide insights on variances and suggest strategies for improvement.",
+                "data_source": "local_master",
+                "query": """
+                WITH category_performance AS (
+                    SELECT 
+                        Category,
+                        SUM(PurchaseQty) as total_purchased,
+                        SUM(SalesQty) as total_sold,
+                        ROUND(CAST(SUM(SalesQty) AS REAL) / NULLIF(SUM(PurchaseQty), 0) * 100, 2) as sell_through_rate,
+                        COUNT(DISTINCT Brand) as brand_count
+                    FROM master_summary
+                    WHERE lower(Brand) != 'grand total'
+                    GROUP BY Category
+                    HAVING SUM(PurchaseQty) > 0
+                ),
+                overall_average AS (
+                    SELECT 
+                        ROUND(CAST(SUM(SalesQty) AS REAL) / NULLIF(SUM(PurchaseQty), 0) * 100, 2) as avg_sell_through
+                    FROM master_summary
+                    WHERE lower(Brand) != 'grand total'
+                    AND PurchaseQty > 0
+                )
+                SELECT 
+                    cp.Category,
+                    cp.total_purchased,
+                    cp.total_sold,
+                    cp.sell_through_rate,
+                    (cp.sell_through_rate - (SELECT avg_sell_through FROM overall_average)) as variance_from_avg,
+                    cp.brand_count
+                FROM category_performance cp, overall_average
+                ORDER BY variance_from_avg
+                LIMIT 10
+                """
+            },
+            {
+                "id": 6,
+                "question": "Analyze the turnaround time for exchanges and returns to optimize processes.",
+                "data_source": "local_daily",
+                "query": """
+                -- Compare daily files to track changes in sales quantities that might represent returns
+                WITH sequential_days AS (
+                    SELECT 
+                        d1.Brand,
+                        d1.Category,
+                        d1.Size,
+                        d1.Color,
+                        d1.SalesQty as current_sales,
+                        d2.SalesQty as previous_sales,
+                        d1.PurchaseQty as current_purchase,
+                        d2.PurchaseQty as previous_purchase,
+                        d1.date as current_date,
+                        d2.date as previous_date,
+                        d1.file_source as file_source
+                    FROM daily_250615 d1  -- Latest file
+                    LEFT JOIN daily_250614 d2  -- Previous day file
+                    ON d1.Brand = d2.Brand 
+                    AND d1.Category = d2.Category
+                    AND d1.Size = d2.Size
+                    AND d1.Color = d2.Color
+                    WHERE lower(d1.Brand) != 'grand total'
+                ),
+                returns_data AS (
+                    SELECT
+                        Brand,
+                        Category,
+                        Size,
+                        Color,
+                        current_sales,
+                        previous_sales,
+                        CASE 
+                            WHEN previous_sales IS NOT NULL AND current_sales < previous_sales 
+                            THEN (previous_sales - current_sales)
+                            ELSE 0
+                        END as return_qty,
+                        julianday(current_date) - julianday(previous_date) as days_between,
+                        file_source
+                    FROM sequential_days
+                )
+                SELECT
+                    Brand,
+                    Category,
+                    SUM(return_qty) as return_qty,
+                    COUNT(CASE WHEN return_qty > 0 THEN 1 END) as return_count,
+                    ROUND(CAST(SUM(return_qty) AS REAL) / NULLIF(SUM(current_sales), 0) * 100, 2) as return_rate,
+                    AVG(CASE WHEN return_qty > 0 THEN days_between ELSE NULL END) as avg_return_days
+                FROM returns_data
+                GROUP BY Brand, Category
+                HAVING return_qty > 0
+                ORDER BY return_qty DESC
+                LIMIT 10
+                """
+            },
+            {
+                "id": 7,
+                "question": "Generate reports on rejected goods and returns for vendor feedback.",
+                "data_source": "local_daily",
+                "query": """
+                -- Analyze changes across daily files to detect returns and rejections
+                WITH daily_changes AS (
+                    SELECT
+                        d1.Brand,
+                        d1.Category,
+                        d1.Size,
+                        d1.Color,
+                        d1.SalesQty - d2.SalesQty as sales_change,  -- Negative means possible return
+                        d1.PurchaseQty - d2.PurchaseQty as purchase_change,  -- Negative means possible rejection
+                        d1.date as current_date,
+                        d2.date as previous_date
+                    FROM daily_250615 d1  -- Latest day
+                    JOIN daily_250614 d2  -- Previous day
+                    ON d1.Brand = d2.Brand 
+                    AND d1.Category = d2.Category
+                    AND d1.Size = d2.Size
+                    AND d1.Color = d2.Color
+                    WHERE lower(d1.Brand) != 'grand total'
+                ),
+                vendor_feedback AS (
+                    SELECT
+                        Brand,
+                        CASE WHEN sales_change < 0 THEN ABS(sales_change) ELSE 0 END as return_qty,
+                        CASE WHEN purchase_change < 0 THEN ABS(purchase_change) ELSE 0 END as rejected_qty,
+                        julianday(current_date) - julianday(previous_date) as days_gap
+                    FROM daily_changes
+                    WHERE sales_change < 0 OR purchase_change < 0  -- Only returns or rejections
+                )
+                SELECT
+                    Brand,
+                    SUM(return_qty) as return_qty,
+                    SUM(rejected_qty) as rejected_qty,
+                    SUM(return_qty + rejected_qty) as total_issues,
+                    COUNT(*) as issue_count,
+                    AVG(days_gap) as avg_turnaround_days
+                FROM vendor_feedback
+                GROUP BY Brand
+                HAVING total_issues > 0
+                ORDER BY total_issues DESC
+                LIMIT 10
+                """
+            },
+            {
+                "id": 8,
+                "question": "Recommend which products from our stock should be prioritized for online sales.",
+                "data_source": "local_master",
+                "query": """
+                -- Find high-performing items that still have stock
+                SELECT 
+                    Brand,
+                    Category,
+                    Size,
+                    Color,
+                    MRP,
+                    PurchaseQty,
+                    SalesQty,
+                    (PurchaseQty - SalesQty) as remaining_stock,
+                    ROUND((CAST(SalesQty AS REAL) / NULLIF(PurchaseQty, 0)) * 100, 2) as sell_through_rate,
+                    ROUND(MRP * (PurchaseQty - SalesQty), 2) as stock_value
+                FROM master_summary
+                WHERE lower(Brand) != 'grand total'
+                -- Must have remaining stock
+                AND (PurchaseQty - SalesQty) > 0
+                -- Good sell-through rate but not sold out
+                AND (CAST(SalesQty AS REAL) / NULLIF(PurchaseQty, 0)) > 0.4
+                ORDER BY sell_through_rate DESC, stock_value DESC
+                LIMIT 10
+                """
+            },
+            {
+                "id": 9,
+                "question": "Identify unique products that can enhance our online portfolio.",
+                "data_source": "local_master",
+                "query": """
+                SELECT
+                    m1.Brand,
+                    m1.Category,
+                    m1.Size,
+                    m1.Color,
+                    m1.MRP,
+                    m1.SalesQty,
+                    m1.PurchaseQty,
+                    (m1.PurchaseQty - m1.SalesQty) as available_stock,
+                    (SELECT COUNT(*) 
+                     FROM master_summary m2 
+                     WHERE m2.Category = m1.Category 
+                     AND m2.Size = m1.Size
+                     AND lower(m2.Brand) != 'grand total') as category_size_count,
+                    (SELECT COUNT(*) 
+                     FROM master_summary m3 
+                     WHERE m3.Brand = m1.Brand
+                     AND lower(m3.Brand) != 'grand total') as brand_count
+                FROM master_summary m1
+                WHERE lower(m1.Brand) != 'grand total'
+                AND (m1.PurchaseQty - m1.SalesQty) > 0
+                ORDER BY category_size_count ASC, brand_count ASC, m1.MRP DESC
+                LIMIT 10
+                """
+            },
+            {
+                "id": 10,
+                "question": "Identify the top 20% of products contributing to 80% of sales.",
+                "data_source": "local_master",
+                "query": """
+                -- Calculate revenue and running totals using window functions
+                WITH product_revenue AS (
+                    SELECT 
+                        Brand, 
+                        Category, 
+                        Size, 
+                        Color, 
+                        SalesQty, 
+                        MRP, 
+                        CAST(SalesQty AS REAL) * MRP as revenue
+                    FROM master_summary
+                    WHERE lower(Brand) != 'grand total'
+                    AND SalesQty > 0
+                    ORDER BY revenue DESC
+                ),
+                total_revenue AS (
+                    SELECT SUM(revenue) as total FROM product_revenue
+                ),
+                ranked_products AS (
+                    SELECT
+                        Brand,
+                        Category,
+                        Size,
+                        Color,
+                        SalesQty,
+                        MRP,
+                        revenue,
+                        (SELECT total FROM total_revenue) as total_revenue,
+                        ROUND((revenue / (SELECT total FROM total_revenue)) * 100, 2) as percent_of_total,
+                        SUM(revenue) OVER (ORDER BY revenue DESC) as running_total
+                    FROM product_revenue
+                )
+                SELECT
+                    Brand,
+                    Category,
+                    Size,
+                    Color,
+                    SalesQty,
+                    MRP,
+                    revenue,
+                    percent_of_total,
+                    ROUND((running_total / total_revenue) * 100, 2) as cumulative_percent
+                FROM ranked_products
+                -- Only include products up to 80% cumulative revenue
+                WHERE (running_total / total_revenue) <= 0.80
+                ORDER BY revenue DESC
+                LIMIT 10
+                """
+            },
+            {
+                "id": 11,
+                "question": "Suggest strategies to reduce the inventory of low-performing items.",
+                "data_source": "local_master",
+                "query": """
+                -- Identify slow-moving inventory with significant capital tied up
+                SELECT
+                    Brand,
+                    Category,
+                    Size,
+                    Color,
+                    MRP,
+                    SalesQty,
+                    PurchaseQty,
+                    (PurchaseQty - SalesQty) as excess_inventory,
+                    ROUND((CAST(SalesQty AS REAL) / NULLIF(PurchaseQty, 0)) * 100, 2) as sell_through_rate,
+                    ROUND(MRP * (PurchaseQty - SalesQty), 2) as locked_capital,
+                    julianday('now') - julianday(date) as days_in_inventory
+                FROM master_summary
+                WHERE lower(Brand) != 'grand total'
+                -- Must have inventory
+                AND PurchaseQty > 0
+                -- Low sell-through rate
+                AND (CAST(SalesQty AS REAL) / NULLIF(PurchaseQty, 0)) < 0.3
+                -- Must still have excess inventory
+                AND (PurchaseQty - SalesQty) > 0
+                ORDER BY locked_capital DESC, sell_through_rate ASC
+                LIMIT 10
+                """
+            }
+        ]
+    
+    def get_logo_path(self):
+        """Return path to logo image"""
+        if os.path.exists(LOGO_PATH):
+            return LOGO_PATH
+        else:
+            # Ensure default logo exists, otherwise create one
+            if not os.path.exists(DEFAULT_LOGO):
+                os.makedirs(os.path.dirname(DEFAULT_LOGO), exist_ok=True)
+                # Create a simple default logo
+                from PIL import Image, ImageDraw, ImageFont
+                img = Image.new('RGB', (400, 100), color=(255, 255, 255))
+                d = ImageDraw.Draw(img)
+                try:
+                    font = ImageFont.truetype("arial.ttf", 36)
+                except IOError:
+                    font = ImageFont.load_default()
+                d.text((20, 30), "InventorySync", fill=(0, 0, 0), font=font)
+                img.save(DEFAULT_LOGO)
+            return DEFAULT_LOGO
+    
+    def create_plotly_figure(self, data: pd.DataFrame, question_id: int) -> BytesIO:
+        """Create a plotly figure based on the question and data"""
+        buffer = BytesIO()
+        
+        if data.empty:
+            # Create empty figure with message
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No data available for visualization",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=16, color="grey")
+            )
+            fig.update_layout(width=800, height=400)
+            fig.write_image(buffer, format="png")
+            buffer.seek(0)
+            return buffer
+            
+        try:
+            # Convert column names to lowercase for consistent access
+            data.columns = [col.lower() for col in data.columns]
+            
+            if question_id == 1:  # Items reaching inventory thresholds
+                if all(col in data.columns for col in ['percent_sold', 'est_days_to_sellout']):
+                    fig = px.scatter(
+                        data, 
+                        x="percent_sold", 
+                        y="est_days_to_sellout",
+                        color="brand",
+                        size="purchaseqty",
+                        hover_data=["category", "size", "color", "salesqty", "purchaseqty"],
+                        labels={
+                            "percent_sold": "Percentage Sold (%)",
+                            "est_days_to_sellout": "Estimated Days to Sell Out",
+                            "brand": "Brand",
+                            "purchaseqty": "Purchase Quantity",
+                            "category": "Category",
+                            "size": "Size",
+                            "color": "Color",
+                            "salesqty": "Sales Quantity"
+                        },
+                        title="Inventory Alert - Items at Risk of Stock-Out"
+                    )
+                    fig.update_layout(
+                        xaxis=dict(ticksuffix="%"),
+                        height=500,
+                        width=800
+                    )
+                    # Add reference lines for 50% and 75%
+                    y_max = data["est_days_to_sellout"].max() * 1.1 if not data.empty and 'est_days_to_sellout' in data.columns else 100
+                    fig.add_shape(type="line", x0=75, y0=0, x1=75, y1=y_max, 
+                                line=dict(color="red", width=2, dash="dash"))
+                    fig.add_shape(type="line", x0=50, y0=0, x1=50, y1=y_max, 
+                                line=dict(color="orange", width=2, dash="dash"))
+                else:
+                    # Fallback for missing columns
+                    fig = px.bar(
+                        data,
+                        x="brand",
+                        y="purchaseqty" if 'purchaseqty' in data.columns else data.columns[1],
+                        color="category" if 'category' in data.columns else None,
+                        title="Inventory by Brand"
+                    )
+                
+            elif question_id == 2:  # Best-selling items by period
+                if 'period' in data.columns and 'sales' in data.columns:
+                    periods = data['period'].unique()
+                    fig = go.Figure()
+                    
+                    for period in periods:
+                        period_data = data[data['period'] == period]
+                        if not period_data.empty:
+                            product_labels = [f"{b[:10]}<br>{c[:10]}" for b, c in 
+                                             zip(period_data['brand'], period_data['category'])]
+                            
+                            fig.add_trace(go.Bar(
+                                x=product_labels,
+                                y=period_data['sales'],
+                                name=period.capitalize(),
+                                text=period_data['sales'],
+                                textposition='auto'
+                            ))
+                    
+                    fig.update_layout(
+                        title="Best-Selling Items by Period",
+                        xaxis_title="Product",
+                        yaxis_title="Sales Quantity",
+                        barmode='group',
+                        height=500,
+                        width=800
+                    )
+                else:
+                    # Fallback if period column is missing
+                    fig = px.bar(
+                        data,
+                        x="brand" if 'brand' in data.columns else data.columns[0],
+                        y="salesqty" if 'salesqty' in data.columns else data.columns[1],
+                        color="category" if 'category' in data.columns else None,
+                        title="Best-Selling Items"
+                    )
+                
+            elif question_id == 3:  # Non-moving products
+                if all(col in data.columns for col in ['brand', 'purchaseqty', 'days_in_inventory']):
+                    fig = px.bar(
+                        data,
+                        x="brand",
+                        y="purchaseqty",
+                        color="category" if 'category' in data.columns else None,
+                        hover_data=["size", "color", "days_in_inventory"],
+                        labels={
+                            "purchaseqty": "Stock Quantity",
+                            "brand": "Brand",
+                            "days_in_inventory": "Days in Inventory"
+                        },
+                        title="Non-Moving Products by Days in Inventory"
+                    )
+                    
+                    # Add text labels for days in inventory
+                    fig.update_traces(
+                        text=data["days_in_inventory"].round(0).astype(int),
+                        texttemplate="%{text} days",
+                        textposition="outside"
+                    )
+                else:
+                    # Fallback visualization
+                    fig = px.bar(
+                        data,
+                        x="brand" if 'brand' in data.columns else data.columns[0],
+                        y="purchaseqty" if 'purchaseqty' in data.columns else data.columns[1],
+                        title="Non-Moving Products"
+                    )
+                fig.update_layout(height=500, width=800)
+                
+            elif question_id == 4:  # Slow-moving sizes
+                if all(col in data.columns for col in ["category", "size", "percent_sold"]):
+                    fig = px.scatter(
+                        data,
+                        x="percent_sold",
+                        y="avg_days_in_inventory" if "avg_days_in_inventory" in data.columns else "size_count",
+                        color="category",
+                        size="total_purchased" if "total_purchased" in data.columns else None,
+                        text="size",
+                        labels={
+                            "percent_sold": "Percentage Sold (%)",
+                            "avg_days_in_inventory": "Avg Days in Inventory",
+                            "size_count": "Number of Items in Size"
+                        },
+                        title="Slow-Moving Sizes Analysis"
+                    )
+                    fig.update_traces(textposition="top center")
+                    fig.update_layout(
+                        xaxis=dict(ticksuffix="%"),
+                        height=500,
+                        width=800
+                    )
+                else:
+                    # Fallback visualization
+                    fig = px.bar(
+                        data,
+                        x="category" if "category" in data.columns else data.columns[0],
+                        y="percent_sold" if "percent_sold" in data.columns else data.columns[1],
+                        title="Slow-Moving Items Analysis"
+                    )
+                
+            elif question_id == 5:  # Category variance analysis
+                if all(col in data.columns for col in ["variance_from_avg", "category"]):
+                    # Create a horizontal bar chart for variances
+                    colors = ['red' if x < 0 else 'green' for x in data['variance_from_avg']]
+                    
+                    fig = go.Figure(go.Bar(
+                        x=data['variance_from_avg'],
+                        y=data['category'],
+                        orientation='h',
+                        marker_color=colors,
+                        text=data['variance_from_avg'].apply(lambda x: f"{x:+.2f}%"),
+                        textposition='auto'
+                    ))
+                    
+                    fig.update_layout(
+                        title="Category Performance Variance from Average",
+                        xaxis_title="Variance from Average Sell-Through Rate (%)",
+                        yaxis_title="Category",
+                        height=500,
+                        width=800
+                    )
+                    fig.add_vline(x=0, line_width=1, line_dash="dash", line_color="black")
+                else:
+                    # Fallback for missing columns
+                    fig = px.bar(
+                        data,
+                        x=data.columns[0],
+                        y=data.columns[1],
+                        title="Category Performance Analysis"
+                    )
+                
+            elif question_id == 6:  # Returns and exchanges analysis
+                if all(col in data.columns for col in ["brand", "return_qty"]):
+                    fig = px.bar(
+                        data,
+                        x="brand",
+                        y="return_qty",
+                        color="category" if "category" in data.columns else None,
+                        hover_data=["return_count", "return_rate", "avg_return_days"] if all(col in data.columns for col in ["return_count", "return_rate", "avg_return_days"]) else None,
+                        labels={
+                            "return_qty": "Return Quantity",
+                            "brand": "Brand",
+                            "return_rate": "Return Rate (%)",
+                            "avg_return_days": "Avg. Return Days"
+                        },
+                        title="Returns Analysis by Brand"
+                    )
+                    
+                    # Add text labels for return rate if it exists
+                    if "return_rate" in data.columns:
+                        fig.update_traces(
+                            text=data["return_rate"],
+                            texttemplate="%{text:.2f}%",
+                            textposition="outside"
+                        )
+                else:
+                    # Fallback visualization
+                    fig = px.bar(
+                        data,
+                        x=data.columns[0],
+                        y=data.columns[1],
+                        title="Returns Analysis"
+                    )
+                    
+                fig.update_layout(height=500, width=800)
+                
+            elif question_id == 7:  # Rejected goods analysis
+                if all(col in data.columns for col in ["brand", "return_qty", "rejected_qty"]):
+                    # Create stacked bar chart for returns and rejections
+                    fig = go.Figure()
+                    fig.add_trace(go.Bar(
+                        x=data["brand"],
+                        y=data["return_qty"],
+                        name="Returns",
+                        marker_color='indianred'
+                    ))
+                    fig.add_trace(go.Bar(
+                        x=data["brand"],
+                        y=data["rejected_qty"],
+                        name="Rejected",
+                        marker_color='lightsalmon'
+                    ))
+                    
+                    fig.update_layout(
+                        title="Returns and Rejected Goods by Brand",
+                        xaxis_title="Brand",
+                        yaxis_title="Quantity",
+                        barmode='stack',
+                        height=500,
+                        width=800
+                    )
+                else:
+                    # Fallback visualization
+                    fig = px.bar(
+                        data,
+                        x=data.columns[0],
+                        y=data.columns[1] if len(data.columns) > 1 else "value",
+                        title="Returns and Rejected Goods Analysis"
+                    )
+                
+            elif question_id == 8:  # Online sales recommendations
+                if all(col in data.columns for col in ["sell_through_rate", "stock_value"]):
+                    fig = px.scatter(
+                        data,
+                        x="sell_through_rate",
+                        y="stock_value",
+                        color="category" if "category" in data.columns else None,
+                        size="remaining_stock" if "remaining_stock" in data.columns else None,
+                        hover_data=["brand", "size", "color", "mrp"] if all(col in data.columns for col in ["brand", "size", "color", "mrp"]) else None,
+                        labels={
+                            "sell_through_rate": "Sell-Through Rate (%)",
+                            "stock_value": "Remaining Stock Value",
+                            "remaining_stock": "Units in Stock"
+                        },
+                        title="Products Recommended for Online Sales"
+                    )
+                    fig.update_layout(
+                        xaxis=dict(ticksuffix="%"),
+                        height=500,
+                        width=800
+                    )
+                else:
+                    # Fallback visualization
+                    fig = px.bar(
+                        data,
+                        x=data.columns[0],
+                        y=data.columns[1] if len(data.columns) > 1 else "value",
+                        title="Products for Online Sales"
+                    )
+                
+            elif question_id == 9:  # Unique products
+                if all(col in data.columns for col in ["category_size_count", "brand_count"]):
+                    # Use bubble chart to show uniqueness
+                    fig = px.scatter(
+                        data,
+                        x="category_size_count",
+                        y="brand_count",
+                        size="mrp" if "mrp" in data.columns else None,
+                        color="category" if "category" in data.columns else None,
+                        hover_data=["brand", "size", "color", "available_stock"] if all(col in data.columns for col in ["brand", "size", "color", "available_stock"]) else None,
+                        labels={
+                            "category_size_count": "Category/Size Uniqueness (Lower is More Unique)",
+                            "brand_count": "Brand Uniqueness (Lower is More Unique)",
+                            "mrp": "Price Point"
+                        },
+                        title="Unique Products for Online Portfolio Enhancement"
+                    )
+                else:
+                    # Fallback visualization
+                    fig = px.bar(
+                        data,
+                        x=data.columns[0],
+                        y=data.columns[1] if len(data.columns) > 1 else "value",
+                        title="Unique Products Analysis"
+                    )
+                    
+                fig.update_layout(height=500, width=800)
+                
+            elif question_id == 10:  # Pareto analysis (80/20 rule)
+                if all(col in data.columns for col in ["percent_of_total", "cumulative_percent"]):
+                    # Create a Pareto chart
+                    fig = go.Figure()
+                    
+                    # Bar chart for revenue contribution
+                    fig.add_trace(go.Bar(
+                        x=list(range(len(data))),
+                        y=data["percent_of_total"],
+                        name="Revenue Contribution (%)",
+                        marker_color='royalblue',
+                        text=data["percent_of_total"],
+                        texttemplate="%{text:.1f}%",
+                        textposition="outside"
+                    ))
+                    
+                    # Line chart for cumulative percentage
+                    fig.add_trace(go.Scatter(
+                        x=list(range(len(data))),
+                        y=data["cumulative_percent"],
+                        mode='lines+markers',
+                        name="Cumulative Revenue (%)",
+                        marker=dict(color='crimson'),
+                        yaxis="y2",
+                        line=dict(color='crimson')
+                    ))
+                    
+                    # Add 80% reference line
+                    fig.add_hline(y=80, line_width=1, line_dash="dash", line_color="green", 
+                                annotation_text="80% of Revenue", annotation_position="top right")
+                    
+                    fig.update_layout(
+                        title="Pareto Analysis: Top Products by Revenue Contribution",
+                        xaxis=dict(
+                            title="Products (Top Revenue Contributors)",
+                            tickmode='array',
+                            tickvals=list(range(len(data))),
+                            ticktext=[f"{b[:8]}..." for b in data["brand"]] if "brand" in data.columns else [f"Item {i+1}" for i in range(len(data))]
+                        ),
+                        yaxis=dict(
+                            title="Revenue Contribution (%)",
+                            ticksuffix="%"
+                        ),
+                        yaxis2=dict(
+                            title="Cumulative Revenue (%)",
+                            overlaying="y",
+                            side="right",
+                            ticksuffix="%",
+                            range=[0, 100]
+                        ),
+                        height=500,
+                        width=800,
+                        legend=dict(x=0, y=1)
+                    )
+                else:
+                    # Fallback visualization
+                    fig = px.bar(
+                        data,
+                        x=data.columns[0],
+                        y=data.columns[1] if len(data.columns) > 1 else "value",
+                        title="Top Products Analysis"
+                    )
+                
+            elif question_id == 11:  # Low-performing inventory reduction
+                if all(col in data.columns for col in ["sell_through_rate", "locked_capital"]):
+                    fig = px.scatter(
+                        data,
+                        x="sell_through_rate",
+                        y="locked_capital",
+                        color="category" if "category" in data.columns else None,
+                        size="excess_inventory" if "excess_inventory" in data.columns else None,
+                        hover_data=["brand", "size", "color", "mrp", "days_in_inventory"] if all(col in data.columns for col in ["brand", "size", "color", "mrp", "days_in_inventory"]) else None,
+                        labels={
+                            "sell_through_rate": "Sell-Through Rate (%)",
+                            "locked_capital": "Locked Capital Value",
+                            "excess_inventory": "Excess Inventory Units",
+                            "days_in_inventory": "Days in Inventory"
+                        },
+                        title="Low-Performing Items with Locked Capital"
+                    )
+                    fig.update_layout(
+                        xaxis=dict(ticksuffix="%"),
+                        height=500,
+                        width=800
+                    )
+                else:
+                    # Fallback visualization
+                    fig = px.bar(
+                        data,
+                        x=data.columns[0],
+                        y=data.columns[1] if len(data.columns) > 1 else "value",
+                        title="Low-Performing Inventory Analysis"
+                    )
+                
+            else:
+                # Generic bar chart for any other question
+                if 'brand' in data.columns and 'category' in data.columns:
+                    y_column = [col for col in data.columns if col not in ['brand', 'category']][0] if len(data.columns) > 2 else data.columns[1]
+                    fig = px.bar(
+                        data,
+                        x="brand",
+                        y=y_column,
+                        color="category",
+                        title=f"Analysis for Question {question_id}"
+                    )
+                else:
+                    # Very generic fallback
+                    fig = px.bar(
+                        data,
+                        x=data.columns[0],
+                        y=data.columns[1] if len(data.columns) > 1 else "value",
+                        title=f"Analysis for Question {question_id}"
+                    )
+                fig.update_layout(height=500, width=800)
+            
+            # Common layout improvements for all charts
+            fig.update_layout(
+                template="plotly_white",
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=-0.3,
+                    xanchor="center",
+                    x=0.5
+                ),
+                margin=dict(l=50, r=50, t=80, b=100)
+            )
+            
+            fig.write_image(buffer, format="png")
+            buffer.seek(0)
+            return buffer
+            
+        except Exception as e:
+            print(f"Error creating visualization for question {question_id}: {str(e)}")
+            # Create error figure
+            fig = go.Figure()
+            fig.add_annotation(
+                text=f"Error creating visualization: {str(e)}",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=14, color="red")
+            )
+            fig.update_layout(width=800, height=400)
+            fig.write_image(buffer, format="png")
+            buffer.seek(0)
+            return buffer
+    
+    def execute_query_for_question(self, question):
+        """Execute the query for a specific question"""
+        query = question["query"]
+        data_source = question["data_source"]
+        
+        if data_source == "neon_db":
+            result = self.data_manager.execute_neon_query(query)
+        elif data_source == "local_master" or data_source == "local_daily":
+            result = self.data_manager.execute_sqlite_query(query)
+        else:  # Try local first, then neon
+            result = self.data_manager.execute_sqlite_query(query)
+            if isinstance(result, dict) and "error" in result:
+                print(f"Falling back to Neon DB for question {question['id']}")
+                # Adjust query for Neon DB if needed
+                adjusted_query = query.replace("master_summary", "sales_data")
+                adjusted_query = adjusted_query.replace("daily_", "sales_data")
+                adjusted_query = adjusted_query.replace("Brand", "brand")
+                adjusted_query = adjusted_query.replace("Category", "category")
+                adjusted_query = adjusted_query.replace("Size", "size")
+                adjusted_query = adjusted_query.replace("Color", "color")
+                adjusted_query = adjusted_query.replace("MRP", "mrp")
+                adjusted_query = adjusted_query.replace("SalesQty", "sales_qty")
+                adjusted_query = adjusted_query.replace("PurchaseQty", "purchase_qty")
+                adjusted_query = re.sub(r'julianday\([^)]+\)', "EXTRACT(DAY FROM NOW() - created_at)", adjusted_query)
+                adjusted_query = re.sub(r'julianday\(\'now\'\)\s*-\s*julianday\(date\)', "EXTRACT(DAY FROM NOW() - created_at)", adjusted_query)
+                adjusted_query = adjusted_query.replace("ROUND(", "")
+                adjusted_query = adjusted_query.replace(", 2)", "")
+                adjusted_query = adjusted_query.replace(", 0)", "")
+                
+                result = self.data_manager.execute_neon_query(adjusted_query)
+        
+        # If we still have an error, return empty DataFrame with error message
+        if isinstance(result, dict) and "error" in result:
+            print(f"Error executing query for question {question['id']}: {result['error']}")
+            return pd.DataFrame()
+        
+        return result
+    
+    def get_gemini_analysis(self, question_text, data):
+        """Get natural language analysis from Gemini"""
+        if isinstance(data, pd.DataFrame) and not data.empty:
+            # Convert to JSON format with limit of 10 rows
+            data_json = data.head(10).to_json(orient="records")
+            
+            # Define the prompt for Gemini
+            prompt = f"""
+            I have some business inventory data that answers this question:
+            
+            "{question_text}"
+            
+            Here is the data (limited to 10 rows):
+            {data_json}
+            
+            Please analyze this data and provide:
+            1. A clear, concise summary of what the data shows
+            2. Key insights and patterns
+            3. Business implications and recommendations
+            
+            Format your response in Markdown with headings, bullet points, and emphasis where appropriate.
+            Keep your answer under 300 words and focus on actionable business insights.
+            """
+            
+            try:
+                response = model.generate_content(prompt)
+                return response.text
+            except Exception as e:
+                print(f"Error getting analysis from Gemini: {str(e)}")
+                return f"*Error getting AI analysis: {str(e)}*\n\nThe data shows {len(data)} records with columns: {', '.join(data.columns)}."
+        else:
+            return "*No data available for analysis.*"
+    
+    def get_executive_summary(self, all_analyses):
+        """Generate an executive summary based on all the analyses"""
+        # Combine all analyses
+        combined_analyses = "\n\n---\n\n".join(all_analyses)
+        
+        # Define the prompt for Gemini
+        prompt = f"""
+        I have conducted multiple analyses on our inventory data. Based on these individual analyses, please generate a comprehensive executive summary.
+        
+        Here are the individual analyses:
+        
+        {combined_analyses}
+        
+        Please create an executive summary that:
+        1. Identifies the most critical insights across all analyses
+        2. Highlights major opportunities and challenges
+        3. Provides 3-5 strategic recommendations
+        4. Suggests priorities for immediate action
+        
+        Format your response in Markdown with clear headings, bullet points for key findings, and bold text for critical points.
+        Keep your summary around 500 words and focus on business impact and actionable insights.
+        """
+        
+        try:
+            response = model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            print(f"Error getting executive summary from Gemini: {str(e)}")
+            return f"*Error generating executive summary: {str(e)}*\n\nPlease review the individual analyses for insights."
+    
+    def markdown_to_reportlab(self, md_text):
+        """Convert markdown text to ReportLab elements"""
+        # Convert markdown to HTML
+        html = markdown(md_text)
+        
+        # Parse HTML
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # Get styles
+        styles = getSampleStyleSheet()
+        
+        # Create custom styles with different names to avoid conflicts
+        custom_heading1 = ParagraphStyle(
+            'CustomHeading1',
+            fontName='Helvetica-Bold',
+            fontSize=16,
+            textColor=colors.HexColor('#003366'),
+            spaceAfter=12
+        )
+        
+        custom_heading2 = ParagraphStyle(
+            'CustomHeading2',
+            fontName='Helvetica-Bold',
+            fontSize=14,
+            textColor=colors.HexColor('#003366'),
+            spaceAfter=10
+        )
+        
+        custom_heading3 = ParagraphStyle(
+            'CustomHeading3',
+            fontName='Helvetica-Bold',
+            fontSize=12,
+            textColor=colors.HexColor('#003366'),
+            spaceAfter=8
+        )
+        
+        custom_bullet = ParagraphStyle(
+            'CustomBullet',
+            fontName='Helvetica',
+            fontSize=10,
+            leftIndent=20,
+            bulletIndent=10,
+            spaceBefore=2,
+            spaceAfter=2
+        )
+        
+        # Process HTML and create elements
+        elements = []
+        
+        for tag in soup.find_all(['h1', 'h2', 'h3', 'p', 'ul', 'ol', 'li', 'strong', 'em', 'hr', 'blockquote']):
+            if tag.name == 'h1':
+                elements.append(Paragraph(tag.text, custom_heading1))
+            elif tag.name == 'h2':
+                elements.append(Paragraph(tag.text, custom_heading2))
+            elif tag.name == 'h3':
+                elements.append(Paragraph(tag.text, custom_heading3))
+            elif tag.name == 'p':
+                if tag.find('strong') or tag.find('em'):
+                    # Handle paragraph with rich text
+                    text = str(tag)
+                    text = text.replace('<strong>', '<b>').replace('</strong>', '</b>')
+                    text = text.replace('<em>', '<i>').replace('</em>', '</i>')
+                    text = text.replace('<p>', '').replace('</p>', '')
+                    elements.append(Paragraph(text, styles['Normal']))
+                else:
+                    elements.append(Paragraph(tag.text, styles['Normal']))
+            elif tag.name == 'ul':
+                # Handle bulleted list
+                for li in tag.find_all('li'):
+                    bullet_text = '• ' + li.text
+                    elements.append(Paragraph(bullet_text, custom_bullet))
+            elif tag.name == 'ol':
+                # Handle numbered list
+                for i, li in enumerate(tag.find_all('li')):
+                    numbered_text = f"{i+1}. {li.text}"
+                    elements.append(Paragraph(numbered_text, custom_bullet))
+            elif tag.name == 'hr':
+                elements.append(HRFlowable(width='100%', thickness=1, color=colors.lightgrey, spaceBefore=6, spaceAfter=6))
+            elif tag.name == 'blockquote':
+                # Create a styled blockquote
+                blockquote_style = ParagraphStyle(
+                    'BlockQuote',
+                    parent=styles['Normal'],
+                    leftIndent=30,
+                    rightIndent=30,
+                    spaceBefore=6,
+                    spaceAfter=6,
+                    borderWidth=1,
+                    borderColor=colors.lightgrey,
+                    borderPadding=5,
+                    backColor=colors.whitesmoke
+                )
+                elements.append(Paragraph(tag.text, blockquote_style))
+        
+        return elements
+    
+    def create_pdf_report(self, filename="business_report.pdf"):
+        """Create a PDF report with all analyses"""
+        # Archive old report if it exists
+        if os.path.exists(os.path.join(REPORT_DIR, filename)):
+            archive_path = os.path.join(ARCHIVED_REPORTS_DIR, f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{filename}")
+            try:
+                import shutil
+                shutil.copy2(os.path.join(REPORT_DIR, filename), archive_path)
+                print(f"Archived previous report to {archive_path}")
+            except Exception as e:
+                print(f"Error archiving previous report: {str(e)}")
+        
+        # Prepare document
+        report_path = os.path.join(REPORT_DIR, filename)
+        doc = SimpleDocTemplate(
+            report_path,
+            pagesize=A4,
+            rightMargin=72,
+            leftMargin=72,
+            topMargin=72,
+            bottomMargin=72
+        )
+        
+        # Document elements
+        elements = []
+        
+        # Add Cover Page
+        logo_path = self.get_logo_path()
+        if os.path.exists(logo_path):
+            elements.append(Image(logo_path, width=250, height=100))
+        
+        elements.append(Spacer(1, 40))
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            fontSize=24,
+            textColor=colors.HexColor('#003366'),
+            alignment=TA_CENTER
+        )
+        elements.append(Paragraph("Business Intelligence Report", title_style))
+        elements.append(Spacer(1, 20))
+        
+        subtitle_style = ParagraphStyle(
+            'CustomSubtitle',
+            fontSize=14,
+            textColor=colors.HexColor('#003366'),
+            alignment=TA_CENTER
+        )
+        current_date = datetime.now().strftime("%B %d, %Y")
+        elements.append(Paragraph(f"Generated on {current_date}", subtitle_style))
+        elements.append(Spacer(1, 40))
+        
+        # Add decorative line
+        elements.append(HRFlowable(width='100%', thickness=2, color=colors.HexColor('#003366'), spaceBefore=10, spaceAfter=10))
+        
+        # Add page break after cover
+        elements.append(PageBreak())
+        
+        # Table of Contents
+        elements.append(Paragraph("Table of Contents", styles['Heading1']))
+        elements.append(Spacer(1, 10))
+        
+        toc_data = []
+        for i, q in enumerate(self.questions, 1):
+            question_text = q["question"].strip()
+            # Truncate long questions
+            if len(question_text) > 60:
+                question_text = question_text[:57] + "..."
+            toc_data.append([str(i), question_text, str(i+1)])  # Page numbers are approximate
+            
+        toc_style = TableStyle([
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.lightgrey),
+            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f2f2f2')),
+            ('ALIGNMENT', (0, 0), (0, -1), 'CENTER'),
+            ('ALIGNMENT', (2, 0), (2, -1), 'CENTER'),
+        ])
+        
+        toc_table = Table(toc_data, colWidths=[30, 400, 30])
+        toc_table.setStyle(toc_style)
+        elements.append(toc_table)
+        
+        # Add Executive Summary section reference
+        elements.append(Spacer(1, 10))
+        elements.append(Paragraph("12. Executive Summary", styles['Heading2']))
+        elements.append(Spacer(1, 5))
+        elements.append(Paragraph(f"Page {len(self.questions)+2}", styles['Normal']))
+        
+        elements.append(PageBreak())
+        
+        # Initialize list to store all analyses for executive summary
+        all_analyses = []
+        
+        # Process each question
+        for question in self.questions:
+            question_id = question["id"]
+            question_text = question["question"]
+            
+            # Add question header
+            question_header_style = ParagraphStyle(
+                'CustomQuestionHeader',
+                fontSize=16,
+                textColor=colors.HexColor('#003366'),
+                spaceBefore=0,
+                spaceAfter=10,
+                leading=18
+            )
+            elements.append(Paragraph(f"{question_id}. {question_text}", question_header_style))
+            
+            # Execute query and get data
+            data = self.execute_query_for_question(question)
+            
+            # Generate visualization
+            if not isinstance(data, pd.DataFrame) or data.empty:
+                elements.append(Paragraph("No data available for this question.", styles['Normal']))
+                all_analyses.append(f"Question {question_id}: {question_text}\n\nNo data available.")
+            else:
+                # Get Gemini analysis
+                analysis = self.get_gemini_analysis(question_text, data)
+                all_analyses.append(f"Question {question_id}: {question_text}\n\n{analysis}")
+                
+                # Add analysis text
+                analysis_elements = self.markdown_to_reportlab(analysis)
+                for element in analysis_elements:
+                    elements.append(element)
+                
+                # Add data table (limited to 10 rows)
+                elements.append(Spacer(1, 10))
+                elements.append(Paragraph("Data Sample:", styles['Heading3']))
+                elements.append(Spacer(1, 5))
+                
+                # Format data table
+                df = data.head(10)
+                table_data = [df.columns.tolist()]
+                for _, row in df.iterrows():
+                    formatted_row = []
+                    for val in row:
+                        if isinstance(val, (int, float)):
+                            # Format numbers with comma separators and 2 decimal places
+                            if abs(val) >= 1000:
+                                formatted_val = f"{val:,.2f}"
+                            else:
+                                formatted_val = f"{val:.2f}"
+                            # Remove trailing zeros after decimal
+                            if '.' in formatted_val:
+                                formatted_val = formatted_val.rstrip('0').rstrip('.')
+                        elif isinstance(val, (datetime, pd.Timestamp)):
+                            formatted_val = val.strftime("%Y-%m-%d")
+                        else:
+                            formatted_val = str(val)
+                        formatted_row.append(formatted_val)
+                    table_data.append(formatted_row)
+                
+                # Style the table
+                table_style = TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#003366')),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                    ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, 0), 9),
+                    ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+                    ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#f2f2f2')),
+                    ('TEXTCOLOR', (0, 1), (-1, -1), colors.black),
+                    ('ALIGN', (0, 1), (-1, -1), 'LEFT'),
+                    ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                    ('FONTSIZE', (0, 1), (-1, -1), 8),
+                    ('GRID', (0, 0), (-1, -1), 0.5, colors.lightgrey),
+                ])
+                
+                # Calculate column widths based on data
+                col_widths = [min(max(len(str(cell)) * 5 for cell in col), 80) for col in zip(*table_data)]
+                
+                # Create table
+                data_table = Table(table_data, colWidths=col_widths)
+                data_table.setStyle(table_style)
+                
+                # Wrap table in KeepTogether to avoid splitting across pages if possible
+                elements.append(KeepTogether(data_table))
+                
+                # Add the visualization
+                try:
+                    visual_buffer = self.create_plotly_figure(data, question_id)
+                    elements.append(Spacer(1, 15))
+                    img = Image(visual_buffer, width=450, height=225)
+                    elements.append(img)
+                except Exception as e:
+                    print(f"Error adding visualization for question {question_id}: {str(e)}")
+                    elements.append(Paragraph(f"Error generating visualization: {str(e)}", styles['Normal']))
+            
+            # Add page break after each question
+            elements.append(PageBreak())
+        
+        # Generate Executive Summary
+        executive_summary = self.get_executive_summary(all_analyses)
+        
+        # Add Executive Summary heading
+        exec_summary_title = ParagraphStyle(
+            'CustomExecSummaryTitle',
+            fontSize=18,
+            textColor=colors.HexColor('#003366'),
+            spaceBefore=0,
+            spaceAfter=15
+        )
+        elements.append(Paragraph("Executive Summary", exec_summary_title))
+        
+        # Add executive summary content
+        summary_elements = self.markdown_to_reportlab(executive_summary)
+        for element in summary_elements:
+            elements.append(element)
+        
+        # Build the PDF document
+        doc.build(elements)
+        
+        print(f"Report generated and saved to {report_path}")
+        return report_path
+    
+    def generate_report(self):
+        """Main function to generate the report"""
+        try:
+            # Generate the PDF report
+            report_path = self.create_pdf_report()
+            
+            # Clean up resources
+            self.data_manager.cleanup()
+            
+            return report_path
+        except Exception as e:
+            print(f"Error generating report: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+# Flask routes
+@report_bp.route('/generate-report', methods=['POST'])
+def generate_report_route():
+    try:
+        report_builder = ReportBuilder()
+        report_path = report_builder.generate_report()
+        
+        if report_path:
+            return jsonify({
+                "status": "success",
+                "message": "Report generated successfully",
+                "report_path": report_path,
+                "download_url": f"/download-report/{os.path.basename(report_path)}"
+            })
+        else:
+            return jsonify({
+                "status": "error",
+                "message": "Failed to generate report"
+            }), 500
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Error generating report: {str(e)}"
+        }), 500
+
+@report_bp.route('/download-report/<filename>', methods=['GET'])
+def download_report(filename):
+    try:
+        report_path = os.path.join(REPORT_DIR, filename)
+        if os.path.exists(report_path):
+            return send_file(report_path, as_attachment=True, download_name=filename)
+        else:
+            return jsonify({
+                "status": "error",
+                "message": "Report not found"
+            }), 404
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Error downloading report: {str(e)}"
+        }), 500
+
+@report_bp.route('/list-reports', methods=['GET'])
+def list_reports():
+    try:
+        # List current reports
+        current_reports = []
+        if os.path.exists(REPORT_DIR):
+            for file in os.listdir(REPORT_DIR):
+                if file.endswith('.pdf'):
+                    file_path = os.path.join(REPORT_DIR, file)
+                    current_reports.append({
+                        "filename": file,
+                        "created_at": datetime.fromtimestamp(os.path.getmtime(file_path)).strftime("%Y-%m-%d %H:%M:%S"),
+                        "size": os.path.getsize(file_path),
+                        "download_url": f"/download-report/{file}"
+                    })
+        
+        # List archived reports
+        archived_reports = []
+        if os.path.exists(ARCHIVED_REPORTS_DIR):
+            for file in os.listdir(ARCHIVED_REPORTS_DIR):
+                if file.endswith('.pdf'):
+                    file_path = os.path.join(ARCHIVED_REPORTS_DIR, file)
+                    archived_reports.append({
+                        "filename": file,
+                        "created_at": datetime.fromtimestamp(os.path.getmtime(file_path)).strftime("%Y-%m-%d %H:%M:%S"),
+                        "size": os.path.getsize(file_path),
+                        "download_url": f"/download-archived-report/{file}"
+                    })
+        
+        return jsonify({
+            "status": "success",
+            "current_reports": current_reports,
+            "archived_reports": archived_reports
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Error listing reports: {str(e)}"
+        }), 500
+
+@report_bp.route('/download-archived-report/<filename>', methods=['GET'])
+def download_archived_report(filename):
+    try:
+        report_path = os.path.join(ARCHIVED_REPORTS_DIR, filename)
+        if os.path.exists(report_path):
+            return send_file(report_path, as_attachment=True, download_name=filename)
+        else:
+            return jsonify({
+                "status": "error",
+                "message": "Archived report not found"
+            }), 404
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Error downloading archived report: {str(e)}"
+        }), 500
+    
+
+
+    data.py end backup
+    if __name__ == "__main__":
+    app.run(debug=True, host='0.0.0.0', port=5000)

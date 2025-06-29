@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>InventorySync - Business Assistant</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/toastify-js/src/toastify.min.css">
+    <script src="https://cdn.plot.ly/plotly-2.14.0.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="/static/css/chatbot.css">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/voice_control.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/report.css') }}">
+</head>
+
+<body>
+    <!-- Navigation -->
+    <nav class="navbar navbar-expand-lg">
+        <div class="container-fluid px-4">
+            <a class="navbar-brand" href="#"><i class="fas fa-sync-alt me-2"></i> InventorySync</a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav me-auto">
+                    <li class="nav-item"><a class="nav-link active" href="#upload" data-section="upload">Upload</a></li>
+                    <li class="nav-item"><a class="nav-link" href="#azure-monitoring" data-section="azure-monitoring" onclick="loadAzureStatus()">Azure Monitor</a></li>
+                    <li class="nav-item"><a class="nav-link" href="#data-preview" data-section="data-preview">Data
+                            Preview</a></li>
+                    <a class="nav-link" href="#local-files" data-section="local-files" onclick="loadProcessedFiles()">Check Local Data</a>
+                    <li class="nav-item"><a class="nav-link" href="#visualizations"
+                            data-section="visualizations">Insights</a></li>
+                    
+                    <li class="nav-item"><a class="nav-link" href="#chatbot" data-section="chatbot">Chatbot</a></li>
+                     
+<!-- Add this to the visualizations section header, in the card-header div -->
+<button id="open-report-modal" class="report-btn ms-auto" data-bs-toggle="tooltip" title="Generate Business Report">
+    <i class="fas fa-file-pdf"></i> Generate Report
+</button>     
+                </ul>
+                <div class="navbar-nav ms-auto align-items-center">
+                    <button id="theme-toggle" class="btn btn-outline-light me-3" aria-label="Toggle Theme"><i class="fas fa-moon"></i></button>
+                    <span id="status-indicator" class="status-offline"><i class="fas fa-circle me-1"></i><span
+                            id="connection-status">Checking...</span></span>
+                </div>
+            </div>
+        </div>
+    </nav>
+    <!-- Voice Assistant Button (already in other.html) -->
+<button id="voice-assistant-btn" class="voice-assistant-btn">
+    <svg id="voice-assistant-avatar" class="avatar-idle" width="40" height="40" viewBox="0 0 100 100">
+        <g transform="translate(50, 50)">
+            <circle cx="0" cy="-20" r="20" fill="#4CAF50"/>
+            <path d="M-25 -10 A25 25 0 0 1 25 -10" fill="none" stroke="#fff" stroke-width="5"/>
+            <circle cx="-25" cy="-10" r="5" fill="#fff"/>
+            <rect x="-15" y="0" width="30" height="30" rx="5" fill="#4CAF50"/>
+            <path id="left-arm" d="M-15 5 L-25 15" stroke="#fff" stroke-width="5"/>
+            <path id="right-arm" d="M15 5 L25 15" stroke="#fff" stroke-width="5"/>
+        </g>
+    </svg>
+</button>
+
+    <!-- Loader -->
+        <div id="loader" class="futuristic-loader">
+            <div class="loader-core">
+                <div class="pulse-ring"></div>
+                <div class="pulse-ring delay-1"></div>
+                <div class="pulse-ring delay-2"></div>
+                <div class="loader-icon">
+                    <svg viewBox="0 0 100 100" class="sync-icon">
+                        <path d="M50 20A30 30 0 0 1 80 50c0 3.3-.5 6.5-1.5 9.5l-8-4A22 22 0 0 0 72 50a22 22 0 0 0-22-22V20z" />
+                        <path d="M50 80a30 30 0 0 1-30-30c0-3.3.5-6.5 1.5-9.5l8 4A22 22 0 0 0 28 50a22 22 0 0 0 22 22v8z" />
+                    </svg>
+                </div>
+            </div>
+            <div class="loader-text">Initializing InventorySync...</div>
+        </div>
+
+    <!-- Main Content -->
+    <div class="container-fluid mt-4 px-4">
+        <div id="content">
+            <!-- Upload Section -->
+            <section id="upload" class="section active">
+                <!-- Your existing upload section content remains unchanged -->
+                <div class="row g-4">
+                    <div class="col-md-6">
+                        <div class="card neumorphic">
+                            <div class="card-header">
+                                <h5><i class="fas fa-upload me-2"></i>Data Upload</h5>
+                            </div>
+                            <div class="card-body">
+                                <form id="upload-form" enctype="multipart/form-data">
+                                    <div class="mb-3">
+                                        <label for="file" class="form-label">Excel File</label>
+                                        <input type="file" class="form-control" id="file" name="file"
+                                            accept=".xlsx, .xls" required>
+                                    </div>
+                                    <div class="mb-4">
+                                        <label for="date" class="form-label">Date</label>
+                                        <input type="date" class="form-control" id="date" name="date" required>
+                                    </div>
+                                    <button type="submit" class="btn btn-primary w-100" id="upload-btn"><i
+                                            class="fas fa-upload me-2"></i>Process</button>
+                                </form>
+                            </div>
+                        </div>
+                        <div class="card neumorphic mt-4">
+                            <div class="card-header">
+                                <h5><i class="fas fa-info-circle me-2"></i>Processing Status</h5>
+                            </div>
+                            <div class="card-body">
+                                <div id="upload-status" class="upload-status">
+                                    <div class="status-step" id="step-upload">
+                                        <i class="fas fa-cloud-upload-alt"></i>
+                                        <span>Uploading File to Server</span>
+                                        <div class="step-indicator"></div>
+                                    </div>
+                                    <div class="status-step" id="step-process">
+                                        <i class="fas fa-cogs"></i>
+                                        <span>Processing Data</span>
+                                        <div class="step-indicator"></div>
+                                    </div>
+                                    <div class="status-step" id="step-db">
+                                        <i class="fas fa-database"></i>
+                                        <span>Updating Database</span>
+                                        <div class="step-indicator"></div>
+                                    </div>
+                                    <div class="status-step" id="step-report">
+                                        <i class="fas fa-file-alt"></i>
+                                        <span>Generating Report</span>
+                                        <div class="step-indicator"></div>
+                                    </div>
+                                    <div id="status-message" class="status-message d-none"></div>
+                                </div>
+                                <div id="result-summary" class="d-none mt-4">
+                                    <h6 class="mb-3">Processing Results</h6>
+                                    <div class="row g-3 result-grid">
+                                        <div class="col-6"><span class="result-label">Date:</span> <span
+                                                id="result-date">-</span></div>
+                                        <div class="col-6"><span class="result-label">Records:</span> <span
+                                                id="result-records">-</span></div>
+                                        <div class="col-6"><span class="result-label">New:</span> <span
+                                                id="result-new">-</span></div>
+                                        <div class="col-6"><span class="result-label">Updated:</span> <span
+                                                id="result-updated">-</span></div>
+                                        <div class="col-6"><span class="result-label">Sales:</span> <span
+                                                id="result-daily-sales">-</span></div>
+                                        <div class="col-6"><span class="result-label">Purchases:</span> <span
+                                                id="result-daily-purchases">-</span></div>
+                                        <div class="col-12"><button id="download-btn"
+                                                class="btn btn-outline-primary w-100" disabled>Download Processed
+                                                File</button></div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <div class="card neumorphic h-100">
+                            <div class="card-header">
+                                <h5><i class="fas fa-terminal me-2"></i>Activity Log <button id="clear-logs"
+                                        class="btn btn-sm btn-outline-light"><i class="fas fa-eraser"></i></button></h5>
+                            </div>
+                            <div class="card-body p-0">
+                                <div class="terminal" id="log-container"></div>
+                                <div id="terminal-loader" class="terminal-loader d-none">
+                                    <div class="spinner-border text-accent" role="status"><span
+                                            class="visually-hidden">Loading...</span></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Data Preview Section -->
+            <section id="data-preview" class="section">
+                <!-- Your existing data preview section content remains unchanged -->
+                <div class="card neumorphic">
+                    <div class="card-header">
+                        <h5><i class="fas fa-table me-2"></i>Data Overview</h5>
+                        <div>
+                            <button id="refresh-preview" class="btn btn-sm btn-outline-light me-2"><i
+                                    class="fas fa-sync-alt"></i></button>
+                            <button id="export-data" class="btn btn-sm btn-outline-light"><i
+                                    class="fas fa-file-export"></i> Export</button>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <div class="data-metrics mb-4">
+                            <div class="row g-3">
+                                <div class="col-md-3">
+                                    <div class="metric-card"><i class="fas fa-database"></i>
+                                        <div>
+                                            <div id="metric-total-records">0</div>
+                                            <div>Records</div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="col-md-3">
+                                    <div class="metric-card"><i class="fas fa-tags"></i>
+                                        <div>
+                                            <div id="metric-unique-brands">0</div>
+                                            <div>Brands</div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="col-md-3">
+                                    <div class="metric-card"><i class="fas fa-th-list"></i>
+                                        <div>
+                                            <div id="metric-unique-categories">0</div>
+                                            <div>Categories</div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="col-md-3">
+                                    <div class="metric-card"><i class="fas fa-chart-pie"></i>
+                                        <div>
+                                            <div id="metric-ratio">0%</div>
+                                            <div>Sales/Purchase</div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="table-responsive">
+                            <table id="data-table" class="table">
+                                <thead>
+                                    <tr>
+                                        <th>Brand</th>
+                                        <th>Category</th>
+                                        <th>Size</th>
+                                        <th>MRP</th>
+                                        <th>Color</th>
+                                        <th>Sales</th>
+                                        <th>Purchases</th>
+                                        <th>Week</th>
+                                        <th>Month</th>
+                                        <th>Timestamp</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="data-table-body">
+                                    <tr>
+                                        <td colspan="10" class="text-center">Loading...</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- Local Files Section -->
+            <section id="local-files" class="section">
+                <div class="card neumorphic">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <h5><i class="fas fa-folder-open me-2"></i>Processed Data Files</h5>
+                        <div>
+                            <button class="btn btn-sm btn-outline-light me-2" onclick="downloadAllFiles()" data-bs-toggle="tooltip" title="Download all daily files as ZIP">
+                                <i class="fas fa-download"></i> All
+                            </button>
+                            <button class="btn btn-sm btn-outline-light" onclick="loadProcessedFiles('')" data-bs-toggle="tooltip">
+                                <i class="fas fa-sync-alt"></i> Refresh
+                            </button>
+                        </div>
+                    </div>
+                    <div class="card-body">
+
+                        <p>Manage your Excel files, view previews, and download or delete as needed.</p>
+                        <div id="local-files-loader" class="loader" style="display: none;">
+                            <div class="spinner"></div>
+                        </div>
+                        <div id="processed-files-summary" class="mb-3 fw-semibold"></div>
+                        <div id="processed-files-table" class="table-responsive"></div>
+                    </div>
+                </div>
+            </section>
+            
+            <div class="modal fade" id="fileDetailsModal" tabindex="-1" aria-labelledby="fileDetailsModalLabel" aria-hidden="true">
+                <div class="modal-dialog modal-lg">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h5 class="modal-title" id="fileDetailsModalLabel">File Details</h5>
+                            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                        </div>
+                        <div class="modal-body">
+                            <div id="modal-file-name" class="mb-3"><strong>File:</strong> <span></span></div>
+                            <div id="modal-stats" class="row g-3">
+                                <div class="col-6"><strong>Total Sales:</strong> <span id="modal-total-sales">-</span></div>
+                                <div class="col-6"><strong>Total Purchases:</strong> <span id="modal-total-purchases">-</span></div>
+                                <div class="col-6"><strong>Unique Brands:</strong> <span id="modal-unique-brands">-</span></div>
+                                <div class="col-6"><strong>Unique Categories:</strong> <span id="modal-unique-categories">-</span></div>
+                                <div class="col-12"><strong>Created At:</strong> <span id="modal-created-at">-</span></div>
+                            </div>
+                            <div id="modal-sample" class="table-responsive mt-4"></div>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                            <button type="button" class="btn btn-primary" id="modal-download-btn">Download File</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+             <!-- Azure Monitoring Section -->
+            <section id="azure-monitoring" class="section">
+                <div class="row g-4">
+                    <div class="col-md-6">
+                        <div class="card neumorphic">
+                            <div class="card-header">
+                                <h5><i class="fas fa-cloud me-2"></i>Azure Storage Monitor</h5>
+                                <button id="refresh-azure-status" class="btn btn-sm btn-outline-light">
+                                    <i class="fas fa-sync-alt"></i>
+                                </button>
+                            </div>
+                            <div class="card-body">
+                                <div class="azure-status-grid mb-4">
+                                    <div class="row g-3">
+                                        <div class="col-md-6">
+                                            <div class="metric-card">
+                                                <i class="fas fa-play-circle"></i>
+                                                <div>
+                                                    <div id="scheduler-status">-</div>
+                                                    <div>Scheduler Status</div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div class="col-md-6">
+                                            <div class="metric-card">
+                                                <i class="fas fa-cog"></i>
+                                                <div>
+                                                    <div id="monitoring-mode">-</div>
+                                                    <div>Mode</div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div class="col-md-6">
+                                            <div class="metric-card">
+                                                <i class="fas fa-clock"></i>
+                                                <div>
+                                                    <div id="next-run">-</div>
+                                                    <div>Next Run</div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div class="col-md-6">
+                                            <div class="metric-card">
+                                                <i class="fas fa-file-alt"></i>
+                                                <div>
+                                                    <div id="files-processing">0</div>
+                                                    <div>Processing</div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <div class="mb-3">
+                                    <label class="form-label">Monitoring Mode</label>
+                                    <div class="btn-group w-100" role="group">
+                                        <input type="radio" class="btn-check" name="monitoring-mode" id="mode-testing" value="testing">
+                                        <label class="btn btn-outline-primary" for="mode-testing">Testing (30s)</label>
+                                        
+                                        <input type="radio" class="btn-check" name="monitoring-mode" id="mode-production" value="production">
+                                        <label class="btn btn-outline-primary" for="mode-production">Production (12:15 AM)</label>
+                                    </div>
+                                </div>
+                                
+                                <div class="d-grid gap-2">
+                                    <button id="update-config" class="btn btn-primary">
+                                        <i class="fas fa-save me-2"></i>Update Configuration
+                                    </button>
+                                    <button id="force-check" class="btn btn-outline-secondary">
+                                        <i class="fas fa-search me-2"></i>Force Check Now
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="col-md-6">
+                        <div class="card neumorphic h-100">
+                            <div class="card-header">
+                                <h5><i class="fas fa-list me-2"></i>Azure Files</h5>
+                                <button id="refresh-azure-files" class="btn btn-sm btn-outline-light">
+                                    <i class="fas fa-sync-alt"></i>
+                                </button>
+                            </div>
+                            <div class="card-body">
+                                <div class="azure-files-container">
+                                    <div class="mb-3">
+                                        <h6>Pending Files</h6>
+                                        <div id="pending-files" class="azure-file-list">
+                                            <div class="text-muted">Loading...</div>
+                                        </div>
+                                    </div>
+                                    
+                                    <div class="mb-3">
+                                        <h6>Recently Processed</h6>
+                                        <div id="processed-files" class="azure-file-list">
+                                            <div class="text-muted">Loading...</div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="row g-4 mt-4">
+                    <div class="col-12">
+                        <div class="card neumorphic">
+                            <div class="card-header">
+                                <h5><i class="fas fa-history me-2"></i>Processing Log</h5>
+                                <button id="clear-azure-logs" class="btn btn-sm btn-outline-light">
+                                    <i class="fas fa-eraser"></i> Clear
+                                </button>
+                            </div>
+                            <div class="card-body p-0">
+                                <div class="terminal" id="azure-log-container">
+                                    <div class="terminal-line">
+                                        <span class="timestamp">[INFO]</span>
+                                        <span class="text-info">Azure monitoring system ready</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+            <!-- Visualizations Section -->
+            <section id="visualizations" class="section">
+                <!-- Your existing visualizations section content remains unchanged -->
+                <div class="card neumorphic mb-4">
+                    <div class="card-header">
+                        <h5><i class="fas fa-filter me-2"></i>Filter Insights</h5>
+                    </div>
+                    <div class="card-body">
+                        <form id="date-filter-form" class="row g-3 align-items-end">
+                            <div class="col-md-5"><label for="start-date">Start Date</label><input type="date"
+                                    class="form-control" id="start-date"></div>
+                            <div class="col-md-5"><label for="end-date">End Date</label><input type="date"
+                                    class="form-control" id="end-date"></div>
+                            <div class="col-md-2"><button type="submit" class="btn btn-primary w-100">Apply</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+                <div class="row g-4">
+                    <div class="col-md-6">
+                        <div class="card neumorphic">
+                            <div class="card-header">
+                                <h5><i class="fas fa-chart-bar"></i> Top Brands</h5>
+                            </div>
+                            <div class="card-body">
+                                <div id="brand-chart" class="chart-container"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <div class="card neumorphic">
+                            <div class="card-header">
+                                <h5><i class="fas fa-chart-bar"></i> Top Categories</h5>
+                            </div>
+                            <div class="card-body">
+                                <div id="category-chart" class="chart-container"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <div class="card neumorphic">
+                            <div class="card-header">
+                                <h5><i class="fas fa-chart-line"></i> Monthly Trends</h5>
+                            </div>
+                            <div class="card-body">
+                                <div id="monthly-chart" class="chart-container"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <div class="card neumorphic">
+                            <div class="card-header">
+                                <h5><i class="fas fa-chart-line"></i> Weekly Trends</h5>
+                            </div>
+                            <div class="card-body">
+                                <div id="weekly-chart" class="chart-container"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Chatbot Section -->
+            <section id="chatbot" class="section">
+                <div class="card">
+                    <div class="card-header">
+                        <h5><i class="fas fa-comments me-2"></i>Assistant</h5>
+                    </div>
+                    <div class="card-body p-0">
+                        <div class="chat-container">
+                            <div class="chat-messages" id="chatMessages"></div>
+                            <div class="chat-input-container">
+                                <input type="text" id="messageInput" placeholder="Ask about your inventory..."
+                                    aria-label="Type your message">
+                                <button id="sendButton" class="btn">
+                                    <i class="fas fa-paper-plane"></i>
+                                    <span class="d-none d-md-inline">Send</span>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+          <!-- Add this modal HTML structure right before the closing </body> tag -->
+
+
+
+<div class="report-modal" id="reportModal">
+    <div class="report-modal-content">
+        <div class="report-modal-header">
+            <h5 class="report-modal-title"><i class="fas fa-file-pdf"></i> Business Reports</h5>
+            <button type="button" class="report-modal-close" id="closeReportModal">×</button>
+        </div>
+        <div class="report-modal-body">
+            <div class="report-tabs">
+                <div class="report-tab active" data-tab="generate">Generate Report</div>
+                <div class="report-tab" data-tab="view">View Reports</div>
+                <div class="report-tab" data-tab="archive">Archive</div>
+            </div>
+            
+            <!-- <div class="report-tab-content active" data-tab-content="generate">
+    <div class="report-generation-form">
+        <p>Generate a comprehensive business report with answers to key business questions, visualizations, and strategic recommendations.</p>
+        <div class="mb-3">
+            <label for="reportRecipientEmail" class="form-label">Send report to:</label>
+            <input type="text" class="form-control" id="reportRecipientEmail" placeholder="Enter recipient email(s), separated by commas" required>
+        </div>
+        <button class="btn-generate-report" id="generateReport">
+            <i class="fas fa-file-pdf"></i> Generate Business Report
+        </button>
+    </div>
+    <div id="generationStatus"></div>
+</div> -->
+
+
+            <div class="report-tab-content active" data-tab-content="generate">
+    <div class="report-generation-form">
+        <p>Generate a comprehensive business report with answers to key business questions, visualizations, and strategic recommendations.</p>
+        <div class="mb-3">
+            <label for="reportRecipientEmail" class="form-label">Send report to:</label>
+            <input type="text" class="form-control" id="reportRecipientEmail" placeholder="Enter recipient email(s), separated by commas" required>
+        </div>
+        <!-- Scheduled Email UI START -->
+        <div class="card neumorphic mb-3">
+            <div class="card-header py-2 px-3 d-flex justify-content-between align-items-center">
+                <span><i class="fas fa-envelope me-2"></i>Scheduled Emails</span>
+                <button class="btn btn-sm btn-primary" onclick="showAddScheduleModal()">Add Schedule</button>
+            </div>
+            <div class="card-body py-2 px-3">
+                <div id="schedule-list"></div>
+            </div>
+        </div>
+        <!-- Scheduled Email UI END -->
+        <button class="btn-generate-report" id="generateReport">
+            <i class="fas fa-file-pdf"></i> Generate Business Report
+        </button>
+    </div>
+    <div id="generationStatus"></div>
+</div>
+
+<!-- ###################################################################################################################### -->
+            
+            <div class="report-tab-content" data-tab-content="view">
+                <div id="currentReports">
+                    <div class="report-empty">
+                        <i class="fas fa-file-pdf"></i>
+                        <p>Loading reports...</p>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="report-tab-content" data-tab-content="archive">
+                <div id="archivedReports">
+                    <div class="report-empty">
+                        <i class="fas fa-archive"></i>
+                        <p>Loading archived reports...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+        
+    <!-- Scripts -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/toastify-js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.0/papaparse.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="/static/js/script.js"></script>
+    <!-- Add new chatbot JS -->
+    <script src="/static/js/chatbot.js"></script>
+    <script src="{{ url_for('static', filename='js/voice_control.js') }}"></script>
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.0/js/bootstrap.bundle.min.js"></script>
+    <script src="https://kit.fontawesome.com/4c4d7b1a64.js" crossorigin="anonymous"></script>
+    <script src="{{ url_for('static', filename='js/report.js') }}"></script>
+
+
+
+
+
+
+
+    <!-- ###################################################Add/Edit Modal for Scheduled Email -->
+<div class="modal fade" id="scheduleModal" tabindex="-1" aria-labelledby="scheduleModalLabel" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form id="scheduleForm">
+        <div class="modal-header">
+          <h5 class="modal-title" id="scheduleModalLabel">Add/Edit Email Schedule</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <input type="hidden" id="scheduleId">
+          <div class="mb-3">
+            <label>Email</label>
+            <input type="email" class="form-control" id="scheduleEmail" required>
+          </div>
+          <div class="mb-3">
+            <label>Frequency</label>
+            <select class="form-control" id="scheduleFrequency" required>
+              <option value="daily">Daily</option>
+              <option value="weekly">Weekly</option>
+              <option value="monthly">Monthly</option>
+            </select>
+          </div>
+          <div class="mb-3">
+            <label>Schedule Name</label>
+            <input type="text" class="form-control" id="scheduleName" required>
+          </div>
+          <div class="mb-3">
+            <label>Start Date</label>
+            <input type="date" class="form-control" id="scheduleStartDate" required>
+          </div>
+          <div class="mb-3">
+            <label>End Date</label>
+            <input type="date" class="form-control" id="scheduleEndDate" required>
+          </div>
+          <div class="mb-3">
+            <label>Send Time</label>
+            <input type="time" class="form-control" id="scheduleSendTime" required>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="submit" class="btn btn-primary">Save</button>
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+
+</body>
+
+</html>
