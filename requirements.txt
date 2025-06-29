@@ -19,3 +19,4 @@ schedule
 pytz
 apscheduler
 psycopg2-binary
+markdown==3.7
